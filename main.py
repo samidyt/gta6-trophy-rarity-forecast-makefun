@@ -1,474 +1,487 @@
-"""GTA VI trophy rarity forecaster (gta6-trophy-rarity-forecast-01).
+"""GTA VI trophy rarity forecaster for make.fun bounty gta6-trophy-rarity-forecast-01.
 
-Forecasts each trophy's Exophase earn rate at the case's target as five
-quantiles (5/25/50/75/95%), scored by pinball loss on the logit scale.
+Reads one case per *.in file (the game's 55 PS5 trophies plus the house's
+recording of Exophase's trophy page up to the checkpoint) and writes, for each
+trophy, five quantiles (5/25/50/75/95%) of its earn rate at the target,
+scored by pinball loss on the logit scale.
 
-MODEL -- earners / players decomposition with tier priors
-----------------------------------------------------------
-A trophy's earn rate is r = E / P, earners over players tracked. During a
-launch week both move fast and for different reasons, so the program models
-them separately and divides at the target instead of extrapolating the
-ratio directly (the house trend baseline extrapolates the ratio, which
-conflates progression with denominator dilution).
+Model: earners / players decomposition with tier priors.
 
-1. CLEAN. Exophase refreshes on its own schedule (hours apart), so the
-   recorder's reads are a step function: long flat stretches punctuated by
-   jumps. Exact-duplicate consecutive reads carry no information and are
-   dropped; only distinct reads are fitted.
+A trophy's earn rate is r = E / P, earners over players tracked. In a launch
+week both move fast for different reasons, so the program models them
+separately and divides at the target instead of extrapolating the ratio
+directly (extrapolating the ratio conflates player progression with
+denominator dilution).
 
-2. PLAYERS P(t). log P is fit against ln(1 + hours since launch) over the
-   last 24 hours of distinct reads (all post-refresh, real data), by
-   least squares. Extrapolated to the target, with growth bounded to at
-   most a doubling per day (launch-week growth is fast but not infinite).
+  1. Clean. Exophase refreshes on its own schedule (hours apart), so the
+     reads are a step function: long flat stretches punctuated by jumps.
+     Consecutive duplicate reads are dropped; only distinct reads are fitted.
+  2. Players P(t). log P is fit against ln(1 + hours since launch) over the
+     last 24h of distinct reads, with a concave quadratic term (launch-week
+     player growth decelerates; a straight line overshoots a saturating
+     curve); growth is bounded to a doubling per day.
+  3. Post-refresh reads only. The launch-night reads are a different regime
+     (638 mostly hardcore early-access players, rates far above the refreshed
+     population's). Fitting through them flattens every slope. All fits use
+     only reads with players >= 10% of the last read's count, within 48h of
+     the cutoff.
+  4. Earners E_i(t). Per trophy, log(E + 0.5) is fit against ln(1 + hours)
+     with a concave quadratic term (progression also saturates), recency-
+     weighted; the linear slope is shrunk toward the players slope plus a
+     category adjustment (story trophies catch up faster; grinds grow
+     slower). Extrapolation is damped with a tanh soft cap toward a category
+     day-7 cap (S-curve saturation), and floored at the last observed
+     earners.
+  5. Level prior. When a trophy is early in its expected journey (few
+     earners relative to what its category's day-7 prior implies at the
+     target player count), the median is blended in logit space toward the
+     category's day-7 prior rate (calibrated from GTA V lifetime rarities
+     scaled to one week, and from the real day-1 Exophase rates). A trophy
+     at 100% in the last read (the prologue) is set to 99.9% structurally.
+  6. Spread. Horizon term + fit residual + small-count + cap proximity +
+     prior reliance, combined in quadrature.
+  7. Stale history. With fewer than 3 distinct reads there is no trend to
+     fit, so the program expects a refresh: non-prologue rates are cut to
+     22% of the last read (the spec's published first refresh multiplied
+     players x6.1 while non-prologue earners only x1.34, so rates fell to
+     ~22%), with a wide spread.
 
-   FITS USE POST-REFRESH READS ONLY. The launch-night reads are a
-   different regime: 638 mostly hardcore early-access players, whose
-   rates (0.63-2.04%) are far above the refreshed population's. Fitting
-   through them flattens every slope. So every fit uses only distinct
-   reads with players >= 10% of the last read's count, within 48 hours
-   of the cutoff (relaxed only when that leaves too few reads).
-
-3. EARNERS E_i(t). For each trophy, log(E_i + 0.5) is fit against
-   ln(1 + hours) on the distinct reads. The fitted slope is shrunk
-   toward the players slope plus a category adjustment (story trophies
-   catch up faster than the player base grows; grind/rare trophies grow
-   slower), with shrinkage weight rising in the number of reads. The
-   extrapolation is LOGISTIC-damped toward the cap: earners grow
-   exponentially while far below it, then saturate as they approach
-   P(target) * cap_i, where cap_i is a day-7 plausible-maximum rate
-   for the trophy's category, calibrated from GTA V's lifetime
-   rarities scaled down to one week of play (prologue ~73% lifetime
-   -> ~99.9% week 1; story-complete ~17% -> ~8% week 1; 100% /
-   platinum ~0.1-0.2% -> ~0.3% week 1). Earners are floored at the
-   last observed count (earners never fall).
-
-4. RATE. r_i = E_i(target) / P(target), clamped to [0.01, 99.99]. When
-   few earners were ever observed (a rate printed as 0.00% hides
-   whether 0 or 3 players earned it), the extrapolation says almost
-   nothing about the LEVEL, so the median is blended in logit space
-   toward the trophy category's day-7 prior rate, with weight on the
-   data growing in the observed earner count. The prologue is set to
-   99.9% structurally: everyone who plays earns it.
-
-5. SPREAD. Quantiles are the median on the logit scale plus/minus
-   z_tau * s_i, where s_i combines a horizon term (random-walk growth),
-   the earners fit's residual spread, a small-count term (few earners =
-   noisy), a cap-proximity term, and a prior-reliance term (the more
-   the median leans on the prior, the wider the honest band). Honest,
-   wider spreads for the trophies we know least about.
-
-6. STALE HISTORY. When the history holds fewer than three distinct
-   reads (launch night: every read identical), there is no trend to fit.
-   The program then expects a refresh: non-prologue rates are cut to
-   ~30% of their last value (the observed first refresh multiplied
-   players x6.1 while non-prologue earners only x1.3, so rates fell
-   ~78%), the prologue stays ~99.9%, and the spread is widened to cover
-   both "refresh lands" and "no refresh yet".
-
-Runs offline, standard library only, deterministic (no randomness).
+Python 3.13, standard library only, offline, deterministic.
 """
 
 import json
 import math
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
+# Standard normal quantiles at the scored levels.
+Z = [-1.6448536269514722, -0.6744897501960817, 0.0,
+     0.6744897501960817, 1.6448536269514722]
+LAUNCH = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
 
-# GTA VI release day, 2026-11-19T00:00:00Z: the clock every fit is measured on.
-LAUNCH = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
+# --- model constants -------------------------------------------------------
+# Fit window: reads with players >= this fraction of the last read's count,
+# within this many hours of the checkpoint.
+MIN_PLAYER_FRAC = 0.10
+FIT_WINDOW_HOURS = 48.0
+PLAYERS_FIT_HOURS = 24.0
+# Recency half-life (hours) for the earners-fit weights.
+RECENCY_HALFLIFE_H = 12.0
+# Prior weight: w = 1 / (1 + PRIOR_K * progress), where progress is the
+# trophy's observed earners over the earners its day-7 prior implies at the
+# target player count. A trophy that has covered little of its expected
+# journey leans on the category prior; one nearly there trusts its own data.
+PRIOR_K = 3.0
+# Concave-quadratic fits: curvature clamped to this range (never convex:
+# growth does not accelerate forever) and used only with >= this many points.
+MAX_CURVATURE = 0.0
+MIN_CURVATURE = -1.5
+MIN_QUAD_POINTS = 4
+# Stale-history rule (fewer than 3 distinct reads): expected refresh.
+STALE_MIN_READS = 3
+STALE_FACTOR = 0.22
+STALE_SIGMA = 0.9
+# Spread pieces (logit units).
+BASE_SIGMA = 0.20
+HORIZON_SIGMA = 0.18
+MAX_SIGMA = 1.6
+MIN_SIGMA = 0.2
+PROLOGUE_RATE = 99.9
+PROLOGUE_SIGMA = 0.15
 
-# Base spread growth, logit units per sqrt(day). Slightly wider than the
-# house baseline's 0.5: a 4.5-day launch-week horizon is genuinely uncertain.
-SIGMA_BASE = 0.55
-# Shrinkage strength for earners slopes: weight on the fitted slope is
-# n / (n + SHRINK_K), n = number of distinct reads used.
-SHRINK_K = 3.0
-# Max player growth per day, as a multiple (a doubling a day, sustained,
-# is already an extreme launch-week pace).
-MAX_GROWTH_PER_DAY = 2.0
-# Spread bounds, logit units.
-SPREAD_MIN = 0.30
-SPREAD_MAX = 2.50
+# Category table: day-7 prior rate (%), day-7 cap (%), slope adjustment
+# relative to the players slope. Priors are calibrated from GTA V lifetime
+# rarities scaled down to one week (a launch week's player base is far more
+# casual than a lifetime one) and from the real day-1 Exophase rates.
+CATEGORIES = {
+    "prologue": (99.5, 99.9, 0.0),
+    "story_early": (50.0, 80.0, 0.25),
+    "story_mid": (32.0, 62.0, 0.15),
+    "story_late": (11.0, 32.0, 0.0),
+    "side": (14.0, 38.0, 0.0),
+    "grind": (2.0, 9.0, -0.25),
+    "misc": (9.0, 32.0, -0.05),
+    "platinum": (0.15, 0.6, -0.3),
+    "completion": (0.3, 1.2, -0.3),
+}
+GRIND_WORDS = (
+    "250 stunts", "100 locations", "100 vehicles", "50 challenges",
+    "20 different races", "gold medal", "collectible card", "every spot",
+    "explore all", "purchase all", "earn $", "spend $", "win a top fun",
+)
 
 
-def clamp(x: float, lo: float = 0.01, hi: float = 99.99) -> float:
-    return min(hi, max(lo, x))
+def parse_ts(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def logit(pct: float) -> float:
-    p = clamp(pct) / 100.0
+def hours_since_launch(ts):
+    """Hours from launch (2026-11-19T00:00Z); reads just before launch count
+    as slightly negative, clamped so ln(1 + h) stays defined."""
+    h = (ts - LAUNCH).total_seconds() / 3600.0
+    return max(h, -0.9)
+
+
+def x_of(ts):
+    return math.log1p(hours_since_launch(ts))
+
+
+def clamp_pct(value):
+    return min(99.99, max(0.01, value))
+
+
+def logit(pct):
+    p = clamp_pct(pct) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def inv_logit(lg: float) -> float:
-    if lg >= 0:
-        return 100.0 / (1.0 + math.exp(-lg))
-    e = math.exp(lg)
-    return 100.0 * e / (1.0 + e)
+def sigmoid_to_pct(logit_value):
+    return 100.0 / (1.0 + math.exp(-logit_value))
 
 
-def round4(x: float):
-    """Round to 4 decimals, half up, as JavaScript's Math.round does."""
-    scaled = x * 10000
+def round4(value):
+    """Round to 4 decimals, half up (matching JavaScript's Math.round)."""
+    scaled = value * 10000
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
-    value = whole / 10000
-    return int(value) if value.is_integer() else value
+    result = whole / 10000
+    return int(result) if result.is_integer() else result
 
 
-def parse_time(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
-
-def hours_since_launch(t: datetime) -> float:
-    return max(0.0, (t - LAUNCH).total_seconds() / 3600.0)
-
-
-def ols(xs, ys, ws=None):
-    """Weighted least squares y ~ a + b*x. Returns (a, b, resid_sd, n).
-
-    With < 2 points or zero x-variance, returns the mean as intercept and
-    slope 0. resid_sd is the residual standard deviation (0 when the fit
-    is exact or n <= 2).
-    """
-    n = len(xs)
-    if n == 0:
-        return 0.0, 0.0, 0.0, 0
-    if ws is None:
-        ws = [1.0] * n
-    sw = sum(ws)
-    mx = sum(w * x for w, x in zip(ws, xs)) / sw
-    my = sum(w * y for w, y in zip(ws, ys)) / sw
-    sxx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
-    if sxx <= 0:
-        return my, 0.0, 0.0, n
-    sxy = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys))
-    b = sxy / sxx
-    a = my - b * mx
-    if n <= 2:
-        return a, b, 0.0, n
-    sse = sum(w * (y - (a + b * x)) ** 2 for w, x, y in zip(ws, xs, ys))
-    dof = max(1, n - 2)
-    return a, b, math.sqrt(sse / dof / (sw / n)), n
-
-
-# ---------------------------------------------------------------------------
-# Trophy categories: priors for the day-7 cap and the earners-slope adjustment.
-# Calibrated from GTA V lifetime rarities (PocketPSN/PSNProfiles) scaled to
-# one week of play, and from the observed day-1 Exophase rates.
-# ---------------------------------------------------------------------------
-
-def categorize(trophy):
-    """Return (cap, slope_delta) for a trophy.
-
-    cap: plausible-maximum week-1 earn rate as a fraction (0..1).
-    slope_delta: added to the players slope as the earners-slope prior.
-    """
-    tier = trophy.get("tier", "")
-    name = (trophy.get("name") or "").lower()
-    desc = (trophy.get("description") or "").lower()
-
-    if tier == "platinum":
-        return 0.003, -0.50
-    if "100%" in desc or "100% completion" in desc:
-        return 0.003, -0.50
-    if "gone fishing" in desc or "paradise" in name and "just like" in name:
-        return 0.999, 0.0  # prologue: everyone who plays gets it
-    if "complete chapter 1" in desc:
-        return 0.60, 0.20
-    if "complete chapter 2" in desc:
-        return 0.35, 0.30
-    if "complete chapter 3" in desc:
-        return 0.25, 0.35
-    if "complete chapter 4" in desc:
-        return 0.18, 0.40
-    if "final mission" in desc and tier == "gold":
-        return 0.08, 0.40
-    # Grinds: big counts, every-location / every-spot completions.
-    if any(k in desc for k in ("250 stunts", "100 locations", "3 collectible",
-                               "50 challenges", "every spot", "every location",
-                               "all shooting range", "gold medal in all")):
-        return 0.02, -0.50
+def classify(trophy):
+    """Assign a trophy to a progression category from its description."""
+    desc = trophy.get("description", "")
+    if trophy.get("tier") == "platinum":
+        return "platinum"
+    if "100% Completion" in desc:
+        return "completion"
+    if "Complete Gone Fishing" in desc:
+        return "prologue"
+    if "Complete Chapter 1" in desc or "Complete Chapter 2" in desc:
+        return "story_early"
+    if "Complete Chapter" in desc:
+        return "story_mid"
+    if desc == "Complete the final mission.":
+        return "story_late"
     if "final mission for" in desc or "mission strands" in desc:
-        return 0.08, 0.0
-    if "explore all" in desc:
-        return 0.04, -0.30
-    if tier == "gold":
-        return 0.04, -0.30
-    if tier == "silver":
-        return 0.08, -0.20
-    return 0.20, 0.0  # misc bronze one-offs
+        return "side"
+    lowered = desc.lower()
+    if any(word in lowered for word in GRIND_WORDS):
+        return "grind"
+    if desc.startswith("Complete ") and trophy.get("secret"):
+        return "story_mid"
+    return "misc"
 
 
-def clean_history(case):
-    """Drop exact-duplicate consecutive reads; parse times.
-
-    Returns a list of (hours_since_launch, players, rates) with at least
-    one entry, oldest first. A read is a duplicate when its players count
-    and every rate equal the previous read's.
-    """
+def distinct_reads(history):
+    """Drop consecutive reads identical in players and rates (the page had
+    not refreshed between them); keep each step's first read."""
     out = []
     prev_key = None
-    for read in case["history"]:
-        t = parse_time(read.get("slot") or read["at"])
-        h = hours_since_launch(t)
-        players = read.get("players_tracked")
-        rates = list(read.get("rates") or [])
-        key = (players, tuple(rates))
-        if key == prev_key:
-            continue
-        prev_key = key
-        out.append((h, players, rates))
+    for read in history:
+        key = (read.get("players_tracked"),
+               tuple(read.get("rates") or []))
+        if key != prev_key:
+            out.append(read)
+            prev_key = key
     return out
 
 
-def fit_reads(clean):
-    """Distinct reads usable for fitting: post-refresh, real-sample regime.
-
-    Drops reads with players < 10% of the last read's count (the stale
-    launch-night regime and the first tiny refresh) and reads older than
-    48 hours before the cutoff. Relaxes stepwise when that leaves fewer
-    than 3 reads; always keeps the last read.
-    """
-    if not clean:
-        return []
-    last_h, last_p, _ = clean[-1]
-    if not last_p or last_p <= 0:
-        return clean
-    floor = 0.10 * last_p
-    reads = [(h, p, r) for (h, p, r) in clean
-             if p and p >= floor and h >= last_h - 48.0]
-    if len(reads) < 3:
-        reads = [(h, p, r) for (h, p, r) in clean if p and p >= floor]
-    if len(reads) < 3:
-        reads = list(clean)
-    return reads
+def weighted_line(points):
+    """Weighted least squares for y ~ a + b*x. points are (x, y, w).
+    Returns (a, b, rms_residual)."""
+    sw = sum(p[2] for p in points)
+    mx = sum(p[2] * p[0] for p in points) / sw
+    my = sum(p[2] * p[1] for p in points) / sw
+    sxx = sum(p[2] * (p[0] - mx) ** 2 for p in points)
+    sxy = sum(p[2] * (p[0] - mx) * (p[1] - my) for p in points)
+    slope = sxy / sxx if sxx > 1e-12 else 0.0
+    intercept = my - slope * mx
+    resid = math.sqrt(
+        sum(p[2] * (p[1] - (intercept + slope * p[0])) ** 2 for p in points) / sw
+    )
+    return intercept, slope, resid
 
 
-def forecast_players(clean, target_hours, horizon_days):
-    """Forecast players tracked at the target; returns (P_target, slope)."""
-    if not clean:
-        return 0.0, 0.0
-    last_h, last_p, _ = clean[-1]
-    if last_p is None or last_p <= 0:
-        return 0.0, 0.0
-    # Fit on the last 24 hours of fit reads (post-refresh, real data);
-    # fall back to all fit reads when fewer than 3 sit in the window.
-    usable = fit_reads(clean)
-    window = [(h, p) for (h, p, _) in usable if h >= last_h - 24.0 and p and p > 0]
-    if len(window) < 3:
-        window = [(h, p) for (h, p, _) in usable if p and p > 0]
-    xs = [math.log1p(h) for (h, _) in window]
-    ys = [math.log(p) for (_, p) in window]
-    # Recency weights: the latest read counts double.
-    ws = [1.0 + (i / max(1, len(window) - 1)) for i in range(len(window))]
-    a, b, _, _ = ols(xs, ys, ws)
-    b = max(0.0, b)  # players tracked never shrinks in a launch week
-    x_t = math.log1p(target_hours)
-    log_p = a + b * x_t
-    p_target = math.exp(log_p)
-    # Bound growth: at most a doubling per day over the horizon.
-    cap = last_p * (MAX_GROWTH_PER_DAY ** horizon_days)
-    p_target = min(max(p_target, last_p), cap)
-    return p_target, b
+def _solve_3x3(mat, vec):
+    """Gaussian elimination for a 3x3 system; None if singular."""
+    rows = [list(mat[i]) + [vec[i]] for i in range(3)]
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda r: abs(rows[r][col]))
+        if abs(rows[piv][col]) < 1e-12:
+            return None
+        rows[col], rows[piv] = rows[piv], rows[col]
+        for r in range(col + 1, 3):
+            factor = rows[r][col] / rows[col][col]
+            for c in range(col, 4):
+                rows[r][c] -= factor * rows[col][c]
+    out = [0.0, 0.0, 0.0]
+    for r in (2, 1, 0):
+        out[r] = (rows[r][3] - sum(rows[r][c] * out[c] for c in range(r + 1, 3))
+                  ) / rows[r][r]
+    return out
 
 
-def level_prior(trophy):
-    """Day-7 prior earn rate in percent, by trophy category.
-
-    Used only when the observed earners are too few for the data-driven
-    extrapolation to say anything (a rate printed as 0.00% hides whether
-    0 or 3 players earned it). Calibrated from GTA V lifetime rarities
-    scaled to one week and from the real day-1 Exophase rates
-    (grinds already at 0.03-0.04% on day 1).
-    """
-    tier = trophy.get("tier", "")
-    desc = (trophy.get("description") or "").lower()
-    if tier == "platinum" or "100%" in desc:
-        return 0.05
-    if "gone fishing" in desc:
-        return 99.9
-    if "complete chapter 1" in desc:
-        return 35.0
-    if "complete chapter 2" in desc:
-        return 18.0
-    if "complete chapter 3" in desc:
-        return 10.0
-    if "complete chapter 4" in desc:
-        return 6.0
-    if "final mission" in desc and tier == "gold":
-        return 3.0
-    if any(k in desc for k in ("250 stunts", "100 locations", "3 collectible",
-                               "50 challenges", "every spot", "every location",
-                               "all shooting range", "gold medal in all")):
-        return 0.06
-    if "final mission for" in desc or "mission strands" in desc:
-        return 1.0
-    if "explore all" in desc:
-        return 0.3
-    if tier == "gold":
-        return 0.15
-    if tier == "silver":
-        return 0.3
-    return 3.0  # misc bronze one-offs
+def weighted_quad(points):
+    """Weighted least squares for y ~ a + b*x + c*x^2, with the curvature
+    clamped to [MIN_CURVATURE, MAX_CURVATURE] (concave only) and the line
+    re-fit at the clamped curvature. Returns (a, b, c, rms_residual), or
+    None if the system is degenerate."""
+    # Centre x for conditioning; the fit is shift-invariant.
+    sw = sum(p[2] for p in points)
+    mx = sum(p[2] * p[0] for p in points) / sw
+    centered = [(p[0] - mx, p[1], p[2]) for p in points]
+    # Normal equations in the basis (1, u, u^2).
+    mat = [[0.0] * 3 for _ in range(3)]
+    vec = [0.0] * 3
+    for u, y, w in centered:
+        basis = (1.0, u, u * u)
+        for i in range(3):
+            vec[i] += w * basis[i] * y
+            for j in range(3):
+                mat[i][j] += w * basis[i] * basis[j]
+    sol = _solve_3x3(mat, vec)
+    if sol is None:
+        return None
+    a0, b0, c0 = sol
+    c = min(max(c0, MIN_CURVATURE), MAX_CURVATURE)
+    if abs(c - c0) > 1e-12:
+        # Re-fit the line at the clamped curvature: y - c*u^2 ~ a + b*u.
+        adj = [(u, y - c * u * u, w) for u, y, w in centered]
+        a0, b0, _ = weighted_line(adj)
+    # Shift back to the original x: y = a0 + b0*(x-mx) + c*(x-mx)^2.
+    a = a0 - b0 * mx + c * mx * mx
+    b = b0 - 2.0 * c * mx
+    resid = math.sqrt(sum(
+        p[2] * (p[1] - (a + b * p[0] + c * p[0] * p[0])) ** 2
+        for p in points) / sw)
+    return a, b, c, resid
 
 
-def extrapolate_earners(last_e, b, x_last, x_t, k_cap):
-    """Extrapolate earners from x_last to x_t at log-growth rate b,
-    logistically damped toward carrying capacity k_cap (S-curve
-    saturation: exponential while far below the cap, flattening as it
-    approaches it). Falls back to plain exponential when b <= 0 or the
-    cap is not finite."""
-    e_s = last_e + 0.5
-    gap = max(0.0, x_t - x_last)
-    if b > 0 and k_cap is not None and math.isfinite(k_cap) and k_cap > e_s:
-        k_s = k_cap + 0.5
-        ratio = (k_s - e_s) / e_s
-        return k_s / (1.0 + ratio * math.exp(-b * gap)) - 0.5
-    return math.exp(math.log(e_s) + b * gap) - 0.5
-
-
-def forecast_trophy(idx, trophy, clean, p_target, b_players, target_hours,
-                    horizon_days):
-    """Forecast one trophy's five quantiles at the target."""
-    last_rate = clean[-1][2][idx]
-    if last_rate is None:
-        last_rate = 0.0
-    cap, slope_delta = categorize(trophy)
-    is_prologue = last_rate >= 90.0
-
-    # Earners series on fit reads only (post-refresh regime), recency
-    # weighted: E = rate * P / 100.
-    usable = fit_reads(clean)
-    xs, ys = [], []
-    for (h, p, rates) in usable:
-        r = rates[idx]
-        if r is None or p is None or p <= 0:
+def fit_players(reads, cutoff, x_target):
+    """Fit log players against ln(1 + hours) over the last 24h of distinct
+    reads, with a concave quadratic term when there are enough points
+    (launch-week player growth decelerates); extrapolate to the target with
+    growth bounded to a doubling per day. Returns (players_at_target, slope)
+    where slope is the effective log-slope at the last read."""
+    last_players = reads[-1].get("players_tracked") or 1
+    points = []
+    for read in reads:
+        ts = parse_ts(read["at"])
+        if (cutoff - ts).total_seconds() > PLAYERS_FIT_HOURS * 3600:
             continue
-        xs.append(math.log1p(h))
-        ys.append(math.log(max(0.0, r * p / 100.0) + 0.5))
-    n = len(xs)
-    last_e = max(0.0, last_rate * (clean[-1][1] or 0) / 100.0)
-
-    if n >= 3:
-        ws = [1.0 + (i / max(1, n - 1)) for i in range(n)]
-        a, b_fit, resid_sd, _ = ols(xs, ys, ws)
-        # Shrink the fitted slope toward the players slope + category delta.
-        w = n / (n + SHRINK_K)
-        b = w * b_fit + (1.0 - w) * (b_players + slope_delta)
-        x_t = math.log1p(target_hours)
-        # Re-anchor at the last observation so level errors don't compound.
-        x_last = math.log1p(clean[-1][0])
-        k_cap = cap * p_target if p_target > 0 else None
-        e_target = extrapolate_earners(last_e, b, x_last, x_t, k_cap)
-    elif n >= 1:
-        # Too few points for a fit: grow earners with the players slope.
-        b = b_players + slope_delta
-        x_t = math.log1p(target_hours)
-        x_last = xs[-1] if xs else math.log1p(clean[-1][0])
-        k_cap = cap * p_target if p_target > 0 else None
-        e_target = extrapolate_earners(last_e, b, x_last, x_t, k_cap)
-        resid_sd = 0.5
+        players = read.get("players_tracked") or 0
+        if players <= 0:
+            continue
+        points.append((x_of(ts), math.log(players), 1.0))
+    if len(points) < 2:
+        return float(last_players), 0.0
+    # Bound: at most a doubling over the day ending at the target.
+    h_target = math.expm1(x_target)
+    day_span = math.log1p(h_target) - math.log1p(max(h_target - 24.0, -0.9))
+    max_slope = math.log(2.0) / day_span if day_span > 1e-9 else 0.0
+    x_last = points[-1][0]
+    if len(points) >= MIN_QUAD_POINTS:
+        quad = weighted_quad(points)
     else:
-        e_target = last_e
-        resid_sd = 0.8
-
-    e_target = max(e_target, last_e)  # earners never fall
-    e_target = min(e_target, p_target * cap) if p_target > 0 else e_target
-    median = (e_target / p_target * 100.0) if p_target > 0 else last_rate
-    if is_prologue:
-        # Structural: the prologue is earned by ~everyone who plays, so
-        # its rate sits at the top of the scale whatever the fits say.
-        median = 99.9
-    else:
-        # Bayesian level blend: when few earners were ever observed, the
-        # extrapolation has almost no information about the LEVEL, so
-        # shrink toward the category's day-7 prior rate. Weight on the
-        # data grows with the observed earner count.
-        w_data = last_e / (last_e + 10.0)
-        prior = level_prior(trophy)
-        lg_blend = w_data * logit(median) + (1.0 - w_data) * logit(prior)
-        median = inv_logit(lg_blend)
-    median = clamp(median)
-
-    # Spread: horizon term + fit residual + small-count + cap proximity
-    # + prior reliance (the more the median leans on the prior, the
-    # wider the honest band).
-    s_h = SIGMA_BASE * math.sqrt(max(horizon_days, 0.0))
-    s_fit = min(1.0, resid_sd)
-    s_small = 0.30 * max(0.0, 1.0 - last_e / 20.0) if last_e < 20 else 0.0
-    near_cap = p_target > 0 and e_target >= 0.8 * p_target * cap
-    s_cap = 0.30 if near_cap else 0.0
-    w_data = 1.0 if is_prologue else last_e / (last_e + 10.0)
-    s_prior = 0.60 * (1.0 - w_data)
-    s = math.sqrt(s_h ** 2 + s_fit ** 2 + s_small ** 2 + s_cap ** 2
-                  + s_prior ** 2)
-    s = min(SPREAD_MAX, max(SPREAD_MIN, s))
-    if is_prologue:
-        s = min(s, 1.0)
-
-    lg = logit(median)
-    qs = [round4(clamp(inv_logit(lg + z * s), 0.0, 100.0)) for z in Z]
-    # Keep quantiles non-decreasing after rounding.
-    for i in range(1, 5):
-        if qs[i] < qs[i - 1]:
-            qs[i] = qs[i - 1]
-    return {"id": trophy["id"], "q": qs}
+        quad = None
+    if quad is not None:
+        intercept, slope, curv, _ = quad
+        # Effective slope at the target, bounded; re-anchor the curve at the
+        # last point so the bound bends the path, not the level.
+        slope_tgt = slope + 2.0 * curv * x_target
+        slope_tgt = min(max(slope_tgt, 0.0), max_slope)
+        log_last = intercept + slope * x_last + curv * x_last * x_last
+        # Integrate the (linearly decaying) slope from x_last to x_target.
+        slope_last = slope + 2.0 * curv * x_last
+        avg_slope = 0.5 * (min(max(slope_last, 0.0), max_slope) + slope_tgt)
+        log_target = log_last + avg_slope * (x_target - x_last)
+        players_target = math.exp(log_target)
+        eff_slope = min(max(slope_last, 0.0), max_slope)
+        return max(players_target, float(last_players)), eff_slope
+    intercept, slope, _ = weighted_line(points)
+    slope = min(max(slope, 0.0), max_slope)
+    # Re-anchor the intercept at the weighted centroid with the bounded slope.
+    sw = sum(p[2] for p in points)
+    mx = sum(p[2] * p[0] for p in points) / sw
+    my = sum(p[2] * p[1] for p in points) / sw
+    intercept = my - slope * mx
+    players_target = math.exp(intercept + slope * x_target)
+    return max(players_target, float(last_players)), slope
 
 
-def forecast_stale(trophy, last_rate, horizon_days):
-    """Fallback for histories with < 3 distinct reads: expect a refresh.
-
-    Exophase's first refresh multiplied players x6.1 while non-prologue
-    earners only x1.3, so non-prologue rates fell ~78%. The fallback cuts
-    them to ~30% of the last read and widens the spread to cover both
-    "refresh lands" and "no refresh yet". The prologue stays ~99.9%.
-    """
-    if last_rate is None:
-        last_rate = 0.0
-    if last_rate >= 90.0:
-        median = 99.9
-        s = 1.0
-    else:
-        median = clamp(last_rate * 0.30)
-        s = 1.20 + 0.30 * math.sqrt(max(horizon_days, 0.0))
-        s = min(SPREAD_MAX, s)
-    lg = logit(median)
-    qs = [round4(clamp(inv_logit(lg + z * s), 0.0, 100.0)) for z in Z]
-    for i in range(1, 5):
-        if qs[i] < qs[i - 1]:
-            qs[i] = qs[i - 1]
-    return {"id": trophy["id"], "q": qs}
-
-
-def forecast_case(case, name):
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    if not case["history"]:
-        raise ValueError(f"{name} has no history")
+def forecast_case(case):
+    trophies = case["trophies"]
+    history = case.get("history") or []
     horizon_days = case["horizon_minutes"] / 1440.0
-    target_hours = hours_since_launch(parse_time(case["target"]))
-    clean = clean_history(case)
-    last_rates = clean[-1][2]
-    rows = []
-    if len(clean) < 3:
-        for i, trophy in enumerate(case["trophies"]):
-            rows.append(forecast_stale(trophy, last_rates[i], horizon_days))
+    cutoff = parse_ts(case["at"])
+    target = parse_ts(case["target"])
+    x_target = x_of(target)
+
+    def row_for(trophy, median_pct, sigma):
+        center = logit(median_pct)
+        return {"id": trophy["id"],
+                "q": [round4(sigmoid_to_pct(center + z * sigma)) for z in Z]}
+
+    if not history:
+        # No reads at all: fall back to category priors, wide spread.
+        return {"trophies": [
+            row_for(t, CATEGORIES[classify(t)][0], 1.2) for t in trophies]}
+
+    reads = distinct_reads(history)
+    last = history[-1]
+    last_players = last.get("players_tracked") or 1
+    last_rates = last.get("rates") or []
+
+    def last_rate(i):
+        if i < len(last_rates) and last_rates[i] is not None:
+            return last_rates[i]
+        for read in reversed(history):
+            rates = read.get("rates") or []
+            if i < len(rates) and rates[i] is not None:
+                return rates[i]
+        return None
+
+    if len(reads) < STALE_MIN_READS:
+        # Stale history: no trend to fit, so expect a refresh before the
+        # target. The spec's published first refresh took non-prologue rates
+        # to ~22% of their pre-refresh values; the spread stays wide because
+        # the refresh's per-trophy effect is unseen.
+        sigma = math.sqrt(STALE_SIGMA ** 2 +
+                          (HORIZON_SIGMA * math.sqrt(horizon_days)) ** 2)
+        rows = []
+        for i, trophy in enumerate(trophies):
+            rate = last_rate(i)
+            if rate is not None and rate >= 99.99:
+                rows.append(row_for(trophy, PROLOGUE_RATE, PROLOGUE_SIGMA))
+            elif rate is None:
+                rows.append(row_for(trophy, CATEGORIES[classify(trophy)][0],
+                                    sigma))
+            elif rate <= 0:
+                rows.append(row_for(trophy, 0.05, sigma))
+            else:
+                rows.append(row_for(trophy, rate * STALE_FACTOR, sigma))
         return {"trophies": rows}
-    p_target, b_players = forecast_players(clean, target_hours, horizon_days)
-    for i, trophy in enumerate(case["trophies"]):
-        rows.append(forecast_trophy(i, trophy, clean, p_target, b_players,
-                                    target_hours, horizon_days))
+
+    # Fit window: post-refresh reads only, within 48h of the cutoff.
+    window = []
+    for read in reads:
+        ts = parse_ts(read["at"])
+        players = read.get("players_tracked") or 0
+        if players < MIN_PLAYER_FRAC * last_players:
+            continue
+        if (cutoff - ts).total_seconds() > FIT_WINDOW_HOURS * 3600:
+            continue
+        window.append((ts, read))
+    if len(window) < 2:
+        window = [(parse_ts(r["at"]), r) for r in reads[-2:]]
+    window_reads = [r for _, r in window]
+    last_ts = window[-1][0]
+
+    players_target, players_slope = fit_players(window_reads, cutoff, x_target)
+
+    rows = []
+    for i, trophy in enumerate(trophies):
+        category = classify(trophy)
+        prior_pct, cap_pct, slope_adj = CATEGORIES[category]
+        rate_last = last_rate(i)
+
+        if rate_last is not None and rate_last >= 99.99:
+            rows.append(row_for(trophy, PROLOGUE_RATE, PROLOGUE_SIGMA))
+            continue
+
+        # Earners series for this trophy over the fit window.
+        points = []
+        earners_last = 0.0
+        for ts, read in window:
+            rates = read.get("rates") or []
+            if i >= len(rates) or rates[i] is None:
+                continue
+            players = read.get("players_tracked") or 0
+            earners = rates[i] / 100.0 * players
+            earners_last = earners
+            age_h = (last_ts - ts).total_seconds() / 3600.0
+            weight = 0.5 ** (age_h / RECENCY_HALFLIFE_H)
+            points.append((x_of(ts), math.log(earners + 0.5), weight))
+
+        if len(points) >= 2:
+            n = len(points)
+            anchor_slope = players_slope + slope_adj
+            x_last = points[-1][0]
+            quad = weighted_quad(points) if n >= MIN_QUAD_POINTS else None
+            if quad is not None:
+                qa, qb, qc, resid = quad
+                # Effective slope at the last read, shrunk toward the anchor.
+                slope_last = qb + 2.0 * qc * x_last
+                slope = ((n / (n + 2.0)) * slope_last +
+                         (2.0 / (n + 2.0)) * anchor_slope)
+                slope = min(max(slope, -0.3), players_slope + 1.5)
+                # Integrate the decaying slope from the last read to the
+                # target, anchored at the fitted level at the last read.
+                log_last = qa + qb * x_last + qc * x_last * x_last
+                dx = x_target - x_last
+                log_earners_raw = log_last + slope * dx + qc * dx * dx
+            else:
+                _, slope_fit, resid = weighted_line(points)
+                slope = ((n / (n + 2.0)) * slope_fit +
+                         (2.0 / (n + 2.0)) * anchor_slope)
+                slope = min(max(slope, -0.3), players_slope + 1.5)
+                # Re-anchor at the weighted centroid with the shrunk slope.
+                sw = sum(p[2] for p in points)
+                mx = sum(p[2] * p[0] for p in points) / sw
+                my = sum(p[2] * p[1] for p in points) / sw
+                intercept = my - slope * mx
+                log_earners_raw = intercept + slope * x_target
+        else:
+            slope = players_slope + slope_adj
+            resid = 0.5
+            log_earners_raw = (math.log(earners_last + 0.5) +
+                               slope * (x_target - x_of(last_ts)))
+
+        earners_raw = math.exp(log_earners_raw)
+        # Tanh soft cap toward the category day-7 cap (S-curve saturation).
+        earners_cap = cap_pct / 100.0 * players_target
+        if earners_cap > 0:
+            earners_target = earners_cap * math.tanh(earners_raw / earners_cap)
+        else:
+            earners_target = earners_raw
+        earners_target = max(earners_target, earners_last)
+        rate_data = earners_target / players_target * 100.0
+
+        # Level prior: blend toward the category day-7 prior in logit space.
+        # The weight follows the trophy's progress: earners observed so far
+        # over the earners the prior implies at the target player count. A
+        # trophy that has covered little of its expected journey leans on
+        # the prior; one nearly there trusts its own data. A short hop stays
+        # close to the data regardless.
+        earners_prior_target = prior_pct / 100.0 * players_target
+        progress = earners_last / max(earners_prior_target, 1.0)
+        prior_weight = 1.0 / (1.0 + PRIOR_K * progress)
+        prior_weight *= min(1.0, horizon_days / 3.0)
+        center = ((1.0 - prior_weight) * logit(rate_data) +
+                  prior_weight * logit(prior_pct))
+
+        # Spread: horizon + fit residual + small counts + cap proximity +
+        # prior reliance, combined in quadrature.
+        pieces = [
+            BASE_SIGMA,
+            HORIZON_SIGMA * math.sqrt(horizon_days),
+            min(resid, 0.8),
+            0.9 / math.sqrt(earners_last + 2.0),
+            0.5 * max(0.0, rate_data / cap_pct - 0.5) if cap_pct > 0 else 0.0,
+            0.7 * prior_weight,
+        ]
+        sigma = math.sqrt(sum(p * p for p in pieces))
+        sigma = min(max(sigma, MIN_SIGMA), MAX_SIGMA)
+        rows.append({"id": trophy["id"],
+                     "q": [round4(sigmoid_to_pct(center + z * sigma))
+                           for z in Z]})
     return {"trophies": rows}
 
 
@@ -476,9 +489,10 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
+        forecast = forecast_case(case)
         (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+            json.dumps(forecast, separators=(",", ":")) + "\n",
+            encoding="utf-8")
 
 
 if __name__ == "__main__":
